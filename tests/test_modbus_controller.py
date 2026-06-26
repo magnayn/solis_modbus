@@ -122,6 +122,23 @@ class TestModbusControllerTCP(IsolatedAsyncioTestCase):
 
         self.assertIsNone(result)
 
+    async def test_async_read_input_register_retries_after_not_connected(self):
+        """Test that transient 'Not connected' errors trigger one reconnect+retry."""
+        self.mock_client.connected = True
+        first_error = Exception("Modbus Error: [Connection] Not connected[AsyncModbusTcpClient host:502]")
+        success_result = MagicMock()
+        success_result.registers = [11]
+        success_result.isError = MagicMock(return_value=False)
+        self.mock_client.read_input_registers = AsyncMock(side_effect=[first_error, success_result])
+        self.controller.connect = AsyncMock(return_value=True)
+
+        result, exc = await self.controller.async_read_input_registers_with_exception(33132, 1)
+
+        self.assertEqual([11], result)
+        self.assertIsNone(exc)
+        self.assertEqual(2, self.controller.connect.await_count)
+        self.assertEqual(2, self.mock_client.read_input_registers.await_count)
+
     async def test_async_read_holding_register_success(self):
         """Test successful read of holding register."""
         self.mock_client.connected = True

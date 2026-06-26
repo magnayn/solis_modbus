@@ -26,6 +26,7 @@ class TestDataRetrieval(unittest.TestCase):
         self.controller.connection_id = "192.168.1.100:502"
         self.controller.enabled = True
         self.controller.connected = MagicMock(return_value=True)
+        self.controller.connect = AsyncMock(return_value=True)
         self.controller.poll_speed = {PollSpeed.FAST: 5, PollSpeed.NORMAL: 15, PollSpeed.SLOW: 30}
         self.controller.async_read_holding_registers_with_exception = AsyncMock(side_effect=lambda start, count: ([1] * count, None))
         self.controller.async_read_input_registers_with_exception = AsyncMock(side_effect=lambda start, count: ([2] * count, None))
@@ -174,10 +175,12 @@ class TestDataRetrieval(unittest.TestCase):
         """Test get_modbus_updates when controller is not connected."""
         self.controller.enabled = True
         self.controller.connected.return_value = False
+        self.controller.connect = AsyncMock(return_value=False)
 
         await self.data_retrieval.get_modbus_updates([self.fast_group], PollSpeed.FAST)
 
-        # Should return early without doing anything
+        # Should try to reconnect once, then return early if reconnect fails.
+        self.controller.connect.assert_called_once()
         self.controller.async_read_holding_registers_with_exception.assert_not_called()
         self.controller.async_read_input_registers_with_exception.assert_not_called()
 

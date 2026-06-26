@@ -26,11 +26,17 @@ _LOGGER = logging.getLogger(__name__)
 
 # Modbus exception codes we treat as address/map issues worth splitting reads (see data_retrieval recovery).
 RECOVERABLE_REGISTER_READ_EXCEPTIONS = frozenset({2, 3})
+CONNECTION_NOT_READY_EXCEPTION_CODE = -1
 
 
 def _exception_code_from_modbus_result(result) -> int | None:
     """Best-effort Modbus exception code from a pymodbus response object."""
     return getattr(result, "exception_code", None)
+
+
+def _is_not_connected_error(error: Exception) -> bool:
+    """Detect pymodbus transport-not-ready errors that should reconnect+retry."""
+    return "not connected" in str(error).lower()
 
 
 class ModbusController:
@@ -127,6 +133,14 @@ class ModbusController:
         # Modbus Write Queue
         self.write_queue = asyncio.Queue()
         self._last_modbus_success = datetime.now(UTC)
+
+    def _close_client_safely(self) -> None:
+        """Close the underlying client while swallowing cleanup errors."""
+        try:
+            if hasattr(self.client, "connected") and self.client.connected:
+                self.client.close()
+        except Exception:
+            pass
 
     async def process_write_queue(self):
         """Process queued Modbus write requests sequentially.
@@ -305,12 +319,9 @@ class ModbusController:
                 error_msg = str(e)
                 log_fn = _LOGGER.debug if quiet else _LOGGER.error
                 log_fn(f"({self.host}.{self.device_id}) Exception reading input registers at {register}: {error_msg}")
-                # Close connection to clear any stale state/responses
-                try:
-                    if hasattr(self.client, 'connected') and self.client.connected:
-                        self.client.close()
-                except Exception:
-                    pass
+                self._close_client_safely()
+                if _is_not_connected_error(e):
+                    return None, CONNECTION_NOT_READY_EXCEPTION_CODE
                 return None, None
 
     async def _async_read_input_register_raw(self, register, count):
@@ -322,7 +333,17 @@ class ModbusController:
         """Like async_read_input_register but returns (registers, exception_code) for recoverable-read logic."""
         try:
             await self.connect()
-            return await self._async_read_input_register_raw_detailed(register, count, quiet=False)
+            values, err = await self._async_read_input_register_raw_detailed(register, count, quiet=False)
+            if values is None and err == CONNECTION_NOT_READY_EXCEPTION_CODE:
+                _LOGGER.debug(
+                    "(%s.%s) Read failed with disconnected transport at %s; reconnecting and retrying once",
+                    self.host,
+                    self.device_id,
+                    register,
+                )
+                if await self.connect():
+                    return await self._async_read_input_register_raw_detailed(register, count, quiet=False)
+            return values, err
         except Exception as e:
             _LOGGER.error(f"({self.host}.{self.device_id}) Exception while reading input registers starting at {register} (count={count}): {str(e)}")
             return None, None
@@ -341,8 +362,8 @@ class ModbusController:
             Exception: If there is an error during the read operation.
         """
         try:
-            await self.connect()
-            return await self._async_read_input_register_raw(register, count)
+            values, _err = await self.async_read_input_registers_with_exception(register, count)
+            return values
         except Exception as e:
             _LOGGER.error(f"({self.host}.{self.device_id}) Exception while reading input registers starting at {register} (count={count}): {str(e)}")
             return None
@@ -374,12 +395,9 @@ class ModbusController:
                 error_msg = str(e)
                 log_fn = _LOGGER.debug if quiet else _LOGGER.error
                 log_fn(f"({self.host}.{self.device_id}) Exception reading holding registers at {register}: {error_msg}")
-                # Close connection to clear any stale state/responses
-                try:
-                    if hasattr(self.client, 'connected') and self.client.connected:
-                        self.client.close()
-                except Exception:
-                    pass
+                self._close_client_safely()
+                if _is_not_connected_error(e):
+                    return None, CONNECTION_NOT_READY_EXCEPTION_CODE
                 return None, None
 
     async def _async_read_holding_register_raw(self, register, count):
@@ -390,7 +408,17 @@ class ModbusController:
         """Like async_read_holding_register but returns (registers, exception_code) for recoverable-read logic."""
         try:
             await self.connect()
-            return await self._async_read_holding_register_raw_detailed(register, count, quiet=False)
+            values, err = await self._async_read_holding_register_raw_detailed(register, count, quiet=False)
+            if values is None and err == CONNECTION_NOT_READY_EXCEPTION_CODE:
+                _LOGGER.debug(
+                    "(%s.%s) Holding read failed with disconnected transport at %s; reconnecting and retrying once",
+                    self.host,
+                    self.device_id,
+                    register,
+                )
+                if await self.connect():
+                    return await self._async_read_holding_register_raw_detailed(register, count, quiet=False)
+            return values, err
         except Exception as e:
             _LOGGER.error(f"({self.host}.{self.device_id}) Exception while reading holding registers starting at {register} (count={count}): {str(e)}")
             return None, None
@@ -409,8 +437,8 @@ class ModbusController:
             Exception: If there is an error during the read operation.
         """
         try:
-            await self.connect()
-            return await self._async_read_holding_register_raw(register, count)
+            values, _err = await self.async_read_holding_registers_with_exception(register, count)
+            return values
         except Exception as e:
             _LOGGER.error(f"({self.host}.{self.device_id}) Exception while reading holding registers starting at {register} (count={count}): {str(e)}")
             return None
@@ -442,22 +470,12 @@ class ModbusController:
                     return True
                 self.connect_failures += 1
                 _LOGGER.debug(f"⚠️ ({self.host}:{self.port}.{self.device_id}) Connection attempt {self.connect_failures} failed")
-                # Close connection to clear any pending responses/state
-                try:
-                    if hasattr(self.client, 'connected') and self.client.connected:
-                        self.client.close()
-                except Exception:
-                    pass
+                self._close_client_safely()
                 return False
             except Exception as e:
                 self.connect_failures += 1
                 _LOGGER.debug(f"❌ ({self.host}.{self.device_id}) Connection error (attempt {self.connect_failures}): {e}")
-                # Close connection to clear any pending responses/state on connection error
-                try:
-                    if hasattr(self.client, 'connected') and self.client.connected:
-                        self.client.close()
-                except Exception:
-                    pass
+                self._close_client_safely()
                 return False
 
         lock = self.poll_lock

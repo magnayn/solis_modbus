@@ -15,7 +15,7 @@ from custom_components.solis_modbus.helpers import (
 )
 
 from .data.enums import PollSpeed
-from .modbus_controller import RECOVERABLE_REGISTER_READ_EXCEPTIONS, ModbusController
+from .modbus_controller import CONNECTION_NOT_READY_EXCEPTION_CODE, RECOVERABLE_REGISTER_READ_EXCEPTIONS, ModbusController
 from .sensors.solis_base_sensor import SolisSensorGroup, cluster_sensors_by_contiguous_registers
 
 _LOGGER = logging.getLogger(__name__)
@@ -55,10 +55,23 @@ class DataRetrieval:
     async def _probe_register_block_quiet(self, start_register: int, count: int, is_holding: bool) -> tuple[bool, list[int] | None]:
         if count <= 0:
             return True, []
+
+        if not self.controller.connected() and not await self.controller.connect():
+            return False, None
+
         if is_holding:
             vals, _err = await self.controller._async_read_holding_register_raw_detailed(start_register, count, quiet=True)
         else:
             vals, _err = await self.controller._async_read_input_register_raw_detailed(start_register, count, quiet=True)
+
+        if vals is None and _err == CONNECTION_NOT_READY_EXCEPTION_CODE:
+            if not await self.controller.connect():
+                return False, None
+            if is_holding:
+                vals, _err = await self.controller._async_read_holding_register_raw_detailed(start_register, count, quiet=True)
+            else:
+                vals, _err = await self.controller._async_read_input_register_raw_detailed(start_register, count, quiet=True)
+
         if vals is None or len(vals) != count:
             return False, None
         return True, vals
@@ -191,31 +204,32 @@ class DataRetrieval:
         if self.connection_check:
             return
 
+        # Re-entrancy guard: always clear this flag, including early-return paths.
         self.connection_check = True
+        try:
+            # Emit controller status (dispatcher — not persisted to recorder)
+            notify_register_update(self.hass, self.controller, 90005, self.controller.enabled)
 
-        # Emit controller status (dispatcher — not persisted to recorder)
-        notify_register_update(self.hass, self.controller, 90005, self.controller.enabled)
+            if self.controller.connected():
+                if self.first_poll:
+                    await self.modbus_update_all()
+                    self.first_poll = False
+                return
 
-        if self.controller.connected():
-            if self.first_poll:
-                await self.modbus_update_all()
-                self.first_poll = False
-            return
+            retry_delay = 0.5
+            while not self.controller.connected():
+                try:
+                    if await self.controller.connect():
+                        _LOGGER.info(f"✅({self.controller.host}.{self.controller.slave}) Modbus controller connected successfully.")
+                        break
+                    _LOGGER.debug(f"⚠️({self.controller.host}.{self.controller.slave}) Modbus connection failed, retrying in {retry_delay:.2f} seconds...")
+                except Exception as e:
+                    _LOGGER.error(f"❌({self.controller.host}.{self.controller.slave}) Connection error : {e}")
 
-        retry_delay = 0.5
-        while not self.controller.connected():
-            try:
-                if await self.controller.connect():
-                    _LOGGER.info(f"✅({self.controller.host}.{self.controller.slave}) Modbus controller connected successfully.")
-                    break
-                _LOGGER.debug(f"⚠️({self.controller.host}.{self.controller.slave}) Modbus connection failed, retrying in {retry_delay:.2f} seconds...")
-            except Exception as e:
-                _LOGGER.error(f"❌({self.controller.host}.{self.controller.slave}) Connection error : {e}")
-
-            await asyncio.sleep(retry_delay)
-            retry_delay = min(retry_delay * 2, 30)
-
-        self.connection_check = False
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, 30)
+        finally:
+            self.connection_check = False
 
     async def poll_controller(self, event=None):
         """Poll the Modbus controller for data, retrying until success.
@@ -331,8 +345,18 @@ class DataRetrieval:
         Returns:
             None
         """
-        if not self.controller.enabled or not self.controller.connected():
+        if not self.controller.enabled:
             return
+
+        # Fast/normal/slow polls should opportunistically reconnect instead of
+        # waiting for the 2-minute watchdog cycle.
+        if not self.controller.connected():
+            try:
+                if not await self.controller.connect():
+                    return
+            except Exception as exc:
+                _LOGGER.debug("(%s.%s) Reconnect attempt during %s poll failed: %s", self.controller.host, self.controller.slave, speed.name, exc)
+                return
 
         group_hash = frozenset({group.start_register for group in groups})
 
